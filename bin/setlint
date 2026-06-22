@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+# setlint — lint a Claude Code settings.json / settings.local.json.
+# v0.1.3
+#
+# Claude Code reads behavior from settings files (project .claude/
+# settings.json + settings.local.json, and the user-level
+# ~/.claude/settings.json). The highest-stakes thing they do is wire
+# PreToolUse / PostToolUse hooks by a `command` string. If that command
+# does not resolve to a file that exists and is executable, the hook
+# silently never runs — and a guardrail you believe is protecting you
+# is not. setlint checks the wiring: valid JSON, well-formed hooks
+# blocks, and — the flagship — that every command-type hook resolves to
+# an executable on disk (resolving $CLAUDE_PROJECT_DIR the way Claude
+# Code does).
+#
+# hookprobe *runs* a hook with synthetic input; setlint checks that a
+# settings file actually *connects* one. Complementary halves.
+#
+# Bash + jq. Text / --json / --ci output. Exit: 0 clean, 1 warnings
+# only, 2 errors (or usage error).
+set -euo pipefail
+
+VERSION="0.1.3"
+
+# Each finding is "LEVEL\tFILE\tCHECK\tMESSAGE". FILE is the settings
+# file path as discovered/passed; "" for a run-level finding.
+declare -a FINDINGS=()
+ERRORS=0
+WARNINGS=0
+JSON_MODE=0
+CI_MODE=0
+STRICT=0
+QUIET=0
+PROJECT_DIR_OVERRIDE=""
+
+# ANSI colors only when stdout is a tty.
+if [ -t 1 ]; then
+  C_RED=$'\033[31m'; C_YEL=$'\033[33m'; C_GRN=$'\033[32m'
+  C_DIM=$'\033[2m';  C_OFF=$'\033[0m';  C_BLD=$'\033[1m'
+else
+  C_RED=""; C_YEL=""; C_GRN=""; C_DIM=""; C_OFF=""; C_BLD=""
+fi
+
+usage() {
+  cat <<EOF
+setlint $VERSION — lint a Claude Code settings.json / settings.local.json
+
+Usage:
+  setlint [PATH]              lint settings at PATH (default: .)
+  setlint --project-dir DIR   resolve \$CLAUDE_PROJECT_DIR to DIR
+  setlint --json              emit findings as a single JSON document
+  setlint --ci                emit GitHub Actions workflow-command annotations
+  setlint --strict            treat warnings as errors (affects exit code)
+  setlint --quiet             suppress the "clean" line; print findings only
+  setlint --version           print version and exit
+  setlint -h | --help         show this help
+
+PATH may be a settings JSON file, or a directory. For a directory,
+setlint discovers .claude/settings.json, .claude/settings.local.json,
+settings.json and settings.local.json beneath it.
+
+\$CLAUDE_PROJECT_DIR in a hook command is resolved to the project root
+(the directory containing the .claude/ that holds the settings file),
+or to --project-dir if given — the same value Claude Code injects.
+
+Checks (errors fail the lint; warnings are advisory unless --strict):
+  error  invalid-json         file is not parseable JSON
+  error  not-object           top-level JSON is not an object
+  error  hooks-not-object     hooks is present but not an object
+  error  event-not-array      a hooks.<Event> value is not an array
+  error  group-not-object     a matcher group is not an object
+  error  group-hooks-bad      a matcher group's hooks is missing or not an array
+  error  hook-not-object      a hook entry is not an object
+  error  hook-no-type         a hook entry has no type
+  error  hook-command-empty   a command hook has an empty command
+  error  hook-command-missing resolved command path does not exist
+  error  hook-command-not-exec   resolved command path exists but is not executable
+  warn   hook-command-unresolved command has an unresolved \$VAR; cannot verify
+  warn   hook-command-complex    command is a pipeline/compound; not statically checked
+  warn   hook-command-not-on-path bare command not found on PATH at lint time
+  warn   misplaced-permission-key top-level allow/deny/ask belongs under permissions
+  warn   key-typo             top-level key looks like a misspelling
+
+A command containing an unresolved variable is NOT an error: the
+format permits runtime-resolved paths, and flagging them would punish
+correct use. setlint asserts only what it can actually resolve.
+
+Exit codes: 0 clean, 1 warnings only, 2 errors or usage error.
+EOF
+}
+
+die() { printf 'setlint: %s\n' "$1" >&2; exit 2; }
+
+# emit LEVEL FILE CHECK MESSAGE
+emit() {
+  local level="$1" f chk msg
+  # Strip control characters from input-derived fields: a crafted settings
+  # file's command/key could carry an ESC or tab that corrupts the
+  # tab-delimited record, breaks the single-line text / hand-rolled JSON
+  # output, or spoofs the terminal. setlint audits untrusted config, so
+  # this is in scope.
+  f=$(printf '%s' "$2"   | LC_ALL=C tr -d '\001-\037\177')
+  chk=$(printf '%s' "$3" | LC_ALL=C tr -d '\001-\037\177')
+  msg=$(printf '%s' "$4" | LC_ALL=C tr -d '\001-\037\177')
+  FINDINGS+=("$level"$'\t'"$f"$'\t'"$chk"$'\t'"$msg")
+  case "$level" in
+    error) ERRORS=$((ERRORS + 1)) ;;
+    warn)  WARNINGS=$((WARNINGS + 1)) ;;
+  esac
+}
+
+# --- project-dir resolution -------------------------------------------------
+# The project root for a settings file at <proj>/.claude/<name> is <proj>.
+project_dir_for() {
+  local file="$1" dir base
+  if [ -n "$PROJECT_DIR_OVERRIDE" ]; then
+    printf '%s' "$PROJECT_DIR_OVERRIDE"
+    return
+  fi
+  dir="$(cd "$(dirname "$file")" && pwd)"
+  base="$(basename "$dir")"
+  if [ "$base" = ".claude" ]; then
+    printf '%s' "$(dirname "$dir")"
+  else
+    printf '%s' "$dir"
+  fi
+}
+
+# --- command resolution (the flagship) --------------------------------------
+# Given a hook command string, resolve its program and check the wiring.
+check_command() {
+  local file="$1" loc="$2" cmd="$3" projdir="$4"
+
+  # Compound / pipeline commands run via the shell — the "program" is
+  # not a single token we can stat. Say so rather than guess.
+  case "$cmd" in
+    *'|'*|*';'*|*'&'*|*'<'*|*'>'*|*'('*|*')'*|*'`'*)
+      emit warn "$file" hook-command-complex \
+        "$loc: command is a pipeline/compound; not statically checked"
+      return ;;
+  esac
+
+  # The program is the first token. Honor a leading quote so a quoted
+  # path (used to protect spaces, e.g. "$CLAUDE_PROJECT_DIR/h.sh") is
+  # taken whole rather than statted with the quote characters attached.
+  local prog rest
+  case "$cmd" in
+    '"'*) prog="${cmd#\"}"; prog="${prog%%\"*}" ;;
+    "'"*) prog="${cmd#\'}"; prog="${prog%%\'*}" ;;
+    *)    read -r prog rest <<<"$cmd" ;;
+  esac
+  [ -n "$prog" ] || { emit error "$file" hook-command-empty "$loc: empty command"; return; }
+
+  # Expand the variables Claude Code itself expands.
+  prog="${prog//\$\{CLAUDE_PROJECT_DIR\}/$projdir}"
+  prog="${prog//\$CLAUDE_PROJECT_DIR/$projdir}"
+  prog="${prog//\$\{HOME\}/$HOME}"
+  prog="${prog//\$HOME/$HOME}"
+  case "$prog" in
+    "~/"*) prog="$HOME/${prog#\~/}" ;;
+    "~")   prog="$HOME" ;;
+  esac
+
+  # Anything still variable-shaped is unresolvable — a warning, not an
+  # error. The format permits runtime-resolved paths.
+  case "$prog" in
+    *'$'*)
+      emit warn "$file" hook-command-unresolved \
+        "$loc: command has an unresolved variable ($prog); cannot verify"
+      return ;;
+  esac
+
+  if [[ "$prog" == */* ]]; then
+    if [ ! -e "$prog" ]; then
+      emit error "$file" hook-command-missing \
+        "$loc: command path does not exist: $prog"
+    elif [ ! -x "$prog" ]; then
+      emit error "$file" hook-command-not-exec \
+        "$loc: command path is not executable: $prog"
+    fi
+  else
+    # Bare program name — resolved off PATH at runtime. Runtime PATH may
+    # differ from lint-time PATH, so a miss is a warning, not an error.
+    if ! command -v "$prog" >/dev/null 2>&1; then
+      emit warn "$file" hook-command-not-on-path \
+        "$loc: command not found on PATH at lint time: $prog"
+    fi
+  fi
+}
+
+# --- per-file lint ----------------------------------------------------------
+# jq program: emits structural findings (prefixed STRUCT) and command
+# rows (prefixed CMD) in one pass. Tabs separate fields.
+JQ_PROG='
+def t: type;
+if t != "object" then
+  "STRUCT\terror\tnot-object\ttop-level JSON has type \(t), expected object"
+elif (has("hooks") | not) then
+  empty
+elif (.hooks | t) != "object" then
+  "STRUCT\terror\thooks-not-object\thooks has type \(.hooks|t), expected object"
+else
+  .hooks | to_entries[] as $ev
+  | if ($ev.value | t) != "array" then
+      "STRUCT\terror\tevent-not-array\thooks.\($ev.key) has type \($ev.value|t), expected array"
+    else
+      $ev.value | to_entries[] as $g
+      | if ($g.value | t) != "object" then
+          "STRUCT\terror\tgroup-not-object\thooks.\($ev.key)[\($g.key)] has type \($g.value|t), expected object"
+        elif ($g.value | has("hooks") | not) or ($g.value.hooks | t) != "array" then
+          "STRUCT\terror\tgroup-hooks-bad\thooks.\($ev.key)[\($g.key)].hooks is missing or not an array"
+        else
+          $g.value.hooks | to_entries[] as $h
+          | if ($h.value | t) != "object" then
+              "STRUCT\terror\thook-not-object\thooks.\($ev.key)[\($g.key)].hooks[\($h.key)] is not an object"
+            elif ($h.value | has("type") | not) then
+              "STRUCT\terror\thook-no-type\thooks.\($ev.key)[\($g.key)].hooks[\($h.key)] has no type"
+            elif $h.value.type == "command" and ((($h.value.command // "") | t) != "string" or (($h.value.command // "") | length) == 0) then
+              "STRUCT\terror\thook-command-empty\thooks.\($ev.key)[\($g.key)].hooks[\($h.key)] has an empty command"
+            elif $h.value.type == "command" then
+              "CMD\thooks.\($ev.key)[\($g.key)].hooks[\($h.key)]\t\($h.value.command)"
+            else empty end
+        end
+    end
+end
+'
+
+# Top-level key sanity. Conservative: only keys that are unambiguously
+# wrong (a known misspelling, or a permission key sitting at top level).
+check_top_keys() {
+  local file="$1" k
+  while IFS= read -r k; do
+    [ -n "$k" ] || continue
+    case "$k" in
+      allow|deny|ask)
+        emit warn "$file" misplaced-permission-key \
+          "top-level \"$k\" belongs under permissions, not at the root" ;;
+      permission)
+        emit warn "$file" key-typo "top-level \"permission\" should be \"permissions\"" ;;
+      hook)
+        emit warn "$file" key-typo "top-level \"hook\" should be \"hooks\"" ;;
+    esac
+  done < <(jq -r 'if type=="object" then keys[] else empty end' "$file" 2>/dev/null)
+}
+
+lint_file() {
+  local file="$1" projdir line kind a b
+  if ! jq -e . "$file" >/dev/null 2>&1; then
+    emit error "$file" invalid-json "not parseable as JSON"
+    return
+  fi
+  check_top_keys "$file"
+  projdir="$(project_dir_for "$file")"
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    kind="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    if [ "$kind" = "STRUCT" ]; then
+      # rest = LEVEL \t CHECK \t MESSAGE
+      IFS=$'\t' read -r a b c <<<"$rest"
+      emit "$a" "$file" "$b" "$c"
+    elif [ "$kind" = "CMD" ]; then
+      # rest = LOC \t COMMAND
+      local loc cmd
+      loc="${rest%%$'\t'*}"
+      cmd="${rest#*$'\t'}"
+      check_command "$file" "$loc" "$cmd" "$projdir"
+    fi
+  done < <(jq -r "$JQ_PROG" "$file" 2>/dev/null)
+}
+
+# --- discovery --------------------------------------------------------------
+discover() {
+  local path="$1"
+  if [ -f "$path" ]; then
+    printf '%s\n' "$path"
+    return
+  fi
+  if [ ! -d "$path" ]; then
+    die "no such file or directory: $path"
+  fi
+  local found=0 c
+  for c in \
+    "$path/.claude/settings.json" \
+    "$path/.claude/settings.local.json" \
+    "$path/settings.json" \
+    "$path/settings.local.json"; do
+    if [ -f "$c" ]; then printf '%s\n' "$c"; found=1; fi
+  done
+  if [ "$found" -eq 0 ]; then
+    die "no settings.json or settings.local.json found under $path"
+  fi
+}
+
+# --- arg parsing ------------------------------------------------------------
+PATH_ARG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json)        JSON_MODE=1 ;;
+    --ci)          CI_MODE=1 ;;
+    --strict)      STRICT=1 ;;
+    --quiet)       QUIET=1 ;;
+    --project-dir) shift; [ $# -gt 0 ] || die "--project-dir needs an argument"; PROJECT_DIR_OVERRIDE="$1" ;;
+    --version)     printf 'setlint %s\n' "$VERSION"; exit 0 ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; break ;;
+    -*)            die "unknown option: $1" ;;
+    *)             [ -z "$PATH_ARG" ] || die "unexpected extra argument: $1"; PATH_ARG="$1" ;;
+  esac
+  shift
+done
+[ $# -gt 0 ] && [ -z "$PATH_ARG" ] && { PATH_ARG="$1"; shift; }
+[ "$JSON_MODE" -eq 1 ] && [ "$CI_MODE" -eq 1 ] && die "--json and --ci are mutually exclusive"
+PATH_ARG="${PATH_ARG:-.}"
+
+# discover() dies with exit 2 on no-match; run it in a command
+# substitution (not process substitution) so that exit propagates here
+# instead of being swallowed by a subshell.
+if ! _discovered="$(discover "$PATH_ARG")"; then
+  exit 2
+fi
+mapfile -t TARGETS <<<"$_discovered"
+for f in "${TARGETS[@]}"; do
+  [ -n "$f" ] || continue
+  lint_file "$f"
+done
+
+# --- reporting --------------------------------------------------------------
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  printf '%s' "$s"
+}
+
+print_text() {
+  if [ ${#FINDINGS[@]} -eq 0 ]; then
+    [ "$QUIET" -eq 1 ] || printf "%ssetlint: clean%s\n" "$C_GRN" "$C_OFF"
+    return
+  fi
+  local prev_file="" f level file check msg color sym
+  for f in "${FINDINGS[@]}"; do
+    IFS=$'\t' read -r level file check msg <<<"$f"
+    if [ "$file" != "$prev_file" ]; then
+      printf "\n%s%s%s\n" "$C_BLD" "$file" "$C_OFF"
+      prev_file="$file"
+    fi
+    case "$level" in
+      error) color="$C_RED"; sym="✗" ;;
+      warn)  color="$C_YEL"; sym="!" ;;
+      *)     color="$C_DIM"; sym="·" ;;
+    esac
+    printf "  %s%s %-24s%s %s\n" "$color" "$sym" "$check" "$C_OFF" "$msg"
+  done
+  printf "\n%s%d errors, %d warnings%s\n" "$C_DIM" "$ERRORS" "$WARNINGS" "$C_OFF"
+}
+
+print_json() {
+  printf '{\n'
+  printf '  "version": "%s",\n' "$VERSION"
+  printf '  "errors": %d,\n' "$ERRORS"
+  printf '  "warnings": %d,\n' "$WARNINGS"
+  printf '  "findings": ['
+  local first=1 f level file check msg
+  for f in "${FINDINGS[@]:-}"; do
+    [ -z "$f" ] && continue
+    IFS=$'\t' read -r level file check msg <<<"$f"
+    if [ "$first" -eq 1 ]; then printf '\n'; first=0; else printf ',\n'; fi
+    printf '    {"level": "%s", "file": "%s", "check": "%s", "message": "%s"}' \
+      "$(json_escape "$level")" "$(json_escape "$file")" \
+      "$(json_escape "$check")" "$(json_escape "$msg")"
+  done
+  [ "$first" -eq 0 ] && printf '\n  '
+  printf ']\n}\n'
+}
+
+print_ci() {
+  local f level file check msg cmd
+  for f in "${FINDINGS[@]:-}"; do
+    [ -z "$f" ] && continue
+    IFS=$'\t' read -r level file check msg <<<"$f"
+    case "$level" in
+      error) cmd="error" ;;
+      *)     cmd="warning" ;;
+    esac
+    printf '::%s file=%s::setlint %s: %s\n' "$cmd" "$file" "$check" "$msg"
+  done
+}
+
+if [ "$JSON_MODE" -eq 1 ]; then
+  print_json
+elif [ "$CI_MODE" -eq 1 ]; then
+  print_ci
+else
+  print_text
+fi
+
+if [ "$ERRORS" -gt 0 ]; then exit 2; fi
+if [ "$WARNINGS" -gt 0 ]; then
+  [ "$STRICT" -eq 1 ] && exit 2
+  exit 1
+fi
+exit 0
