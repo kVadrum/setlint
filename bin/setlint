@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setlint — lint a Claude Code settings.json / settings.local.json.
-# v0.1.3
+# v0.1.4
 #
 # Claude Code reads behavior from settings files (project .claude/
 # settings.json + settings.local.json, and the user-level
@@ -20,7 +20,7 @@
 # only, 2 errors (or usage error).
 set -euo pipefail
 
-VERSION="0.1.3"
+VERSION="0.1.4"
 
 # Each finding is "LEVEL\tFILE\tCHECK\tMESSAGE". FILE is the settings
 # file path as discovered/passed; "" for a run-level finding.

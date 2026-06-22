@@ -12,6 +12,12 @@ adrs/
 # `.claude/` would silently drop those fixtures from the repo.
 /.claude/
 
+# A workspace-global git ignore (~/.config/git/ignore) drops
+# **/.claude/settings.local.json everywhere — but setlint's fixtures ARE
+# exactly that filename (it's the artifact setlint lints). Re-include them
+# so a fresh clone has a complete, runnable test suite.
+!tests/fixtures/**/.claude/settings.local.json
+
 # Local scratch / editor / OS noise
 .DS_Store
 *.swp

@@ -1,0 +1,10 @@
+{
+  "permission": {},
+  "allow": ["Bash"],
+  "hooks": {
+    "PostToolUse": [
+      { "hooks": [ { "type": "command", "command": "$EXTERNAL/run.sh" } ] },
+      { "hooks": [ { "type": "command", "command": "grep x file | wc -l" } ] }
+    ]
+  }
+}
