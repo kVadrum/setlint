@@ -63,7 +63,7 @@ import signal
 import sys
 from collections import Counter
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 # --- schema knowledge -------------------------------------------------------
 #
@@ -427,8 +427,9 @@ def _lint_hook_entry(entry: object, event: str, idx: int, path: str, findings: F
         _lint_hook_runner(runner, f"{where}.hooks[{j}]", path, findings)
 
 
-_JS_NAMED_GROUP = re.compile(r"\(\?<(?![=!])")   # (?<name>… — Python spells it (?P<name>…
-_JS_PROP_CLASS = re.compile(r"\\[pP]\{[^}]*\}")  # \p{L} etc. — no stdlib-re equivalent
+_JS_NAMED_GROUP = re.compile(r"\(\?<(?![=!])")    # (?<name>… — Python spells it (?P<name>…
+_JS_NAMED_BACKREF = re.compile(r"\\k<([^>]*)>")   # \k<name> — Python spells it (?P=name)
+_JS_PROP_CLASS = re.compile(r"\\[pP]\{[^}]*\}")   # \p{L} etc. — no stdlib-re equivalent
 
 
 def _matcher_error(matcher: str) -> str | None:
@@ -447,7 +448,9 @@ def _matcher_error(matcher: str) -> str | None:
         return None
     except re.error as exc:
         first = exc
-    normalized = _JS_PROP_CLASS.sub("X", _JS_NAMED_GROUP.sub("(?P<", matcher))
+    normalized = _JS_NAMED_GROUP.sub("(?P<", matcher)
+    normalized = _JS_NAMED_BACKREF.sub(r"(?P=\1)", normalized)
+    normalized = _JS_PROP_CLASS.sub("X", normalized)
     try:
         re.compile(normalized)
         return None

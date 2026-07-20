@@ -1,1 +1,1 @@
-{"hooks":{"PreToolUse":[{"matcher":"(?<tool>Bash|Edit)","hooks":[{"type":"command","command":"true"}]},{"matcher":"\\p{L}+","hooks":[{"type":"command","command":"true"}]}]}}
+{"hooks": {"PreToolUse": [{"matcher": "(?<tool>Bash|Edit)", "hooks": [{"type": "command", "command": "true"}]}, {"matcher": "\\p{L}+", "hooks": [{"type": "command", "command": "true"}]}, {"matcher": "(?<tool>Bash)\\k<tool>", "hooks": [{"type": "command", "command": "true"}]}]}}
