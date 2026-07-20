@@ -1,0 +1,6 @@
+# $HOME / $CLAUDE_PROJECT_DIR must expand only on a variable-name boundary.
+# A longer variable sharing the prefix ($HOMEBREW_PREFIX, $CLAUDE_PROJECT_DIRT)
+# is unverifiable — a warn — never a mangled concrete path reported missing.
+errors=0
+count.hook-command-unresolved=2
+absent.hook-command-missing=1

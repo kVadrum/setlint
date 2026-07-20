@@ -101,6 +101,7 @@ Errors fail the lint (exit 2). Warnings are advisory (exit 1) unless
 | error | `default-mode-not-string` | `permissions.defaultMode` is not a string |
 | error | `env-not-object` | `env` is not an object |
 | error | `env-value-not-string` | an `env` value is not a string |
+| warn | `duplicate-key` | a key appears more than once in one object — JSON silently keeps only the last |
 | warn | `unknown-key` | unrecognized top-level key |
 | warn | `key-typo` | top-level key looks like a misspelling of a known one |
 | warn | `misplaced-permission-key` | top-level `allow`/`ask`/`deny` belongs under `permissions` |
@@ -180,7 +181,7 @@ tests/run.sh
 Fixture-driven: each `tests/fixtures/<name>/` is a small settings tree
 plus an `expected.txt` of `key=value` assertions (`has.<check>`,
 `level.<check>`, `count.<check>`, `absent.<check>`, `errors`, `warnings`)
-checked against `setlint --json` by `tests/check.py`. The `not-exec`
+checked against `setlint --json` by `tests/check.py`. The `command-not-exec`
 fixture commits a mode-644 hook script, so the executable bit is part of
 the fixture — preserve it under git. Python 3 only; no network.
 

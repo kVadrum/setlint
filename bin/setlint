@@ -61,8 +61,9 @@ import re
 import shutil
 import signal
 import sys
+from collections import Counter
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # --- schema knowledge -------------------------------------------------------
 #
@@ -183,14 +184,28 @@ _HOME = os.path.expanduser("~")
 _PROJECT_DIR_OVERRIDE: str | None = None  # set from --project-dir
 _CMD_COMPLEX = re.compile(r"[|;&<>()`]")
 
+# Only expand on a variable-name boundary: a bare str.replace would also hit
+# the prefix of a longer variable ($HOMEBREW_PREFIX, $HOMEPATH,
+# $CLAUDE_PROJECT_DIRT), and the mangled result — no `$` left — would read as
+# a fully-resolved path and raise a false hook-command-missing *error*. On a
+# boundary miss the `$` survives and the command lands in 'unresolved' (warn),
+# which is the truthful verdict for a variable we can't expand.
+_KNOWN_VAR = re.compile(
+    r"\$(?:\{(CLAUDE_PROJECT_DIR|HOME)\}|(CLAUDE_PROJECT_DIR|HOME)(?![A-Za-z0-9_]))"
+)
+
 
 def _projdir_for(path: str) -> str:
-    """The $CLAUDE_PROJECT_DIR for a settings file: the project root, i.e. the
-    parent of the file's directory (settings live in `<proj>/.claude/`). The
-    --project-dir override wins when given."""
+    """The $CLAUDE_PROJECT_DIR for a settings file. For the canonical layout
+    (`<proj>/.claude/settings.json`) that is the project root above `.claude/`;
+    for a settings file sitting directly in a directory (a layout discover()
+    accepts) it is that directory itself. The --project-dir override wins."""
     if _PROJECT_DIR_OVERRIDE is not None:
         return _PROJECT_DIR_OVERRIDE
-    return os.path.dirname(os.path.dirname(os.path.abspath(path)))
+    parent = os.path.dirname(os.path.abspath(path))
+    if os.path.basename(parent) == ".claude":
+        return os.path.dirname(parent)
+    return parent
 
 
 def _resolve_prog(cmd: str, projdir: str) -> "tuple[str, str]":
@@ -209,13 +224,13 @@ def _resolve_prog(cmd: str, projdir: str) -> "tuple[str, str]":
         prog = parts[0] if parts else ""
     if not prog:
         return "", "empty"
-    # Expand the variables Claude Code itself expands, then ~.
-    prog = prog.replace("${CLAUDE_PROJECT_DIR}", projdir).replace("$CLAUDE_PROJECT_DIR", projdir)
-    prog = prog.replace("${HOME}", _HOME).replace("$HOME", _HOME)
-    if prog.startswith("~/"):
-        prog = os.path.join(_HOME, prog[2:])
-    elif prog == "~":
-        prog = _HOME
+    # Expand the variables Claude Code itself expands, then ~ (expanduser also
+    # covers ~user; an unknown ~user stays literal, which is what a shell does).
+    prog = _KNOWN_VAR.sub(
+        lambda m: projdir if (m.group(1) or m.group(2)) == "CLAUDE_PROJECT_DIR" else _HOME,
+        prog,
+    )
+    prog = os.path.expanduser(prog)
     if "$" in prog:  # still variable-shaped -> unverifiable
         return prog, "unresolved"
     return prog, ""
@@ -229,7 +244,13 @@ def check_command(command: str, where: str, path: str, findings: Findings) -> No
                       f"{where}.command is a pipeline/compound; not statically checked")
         return
     if status == "empty":
-        return  # hook-command-empty already covers this upstream
+        # Reached only when the command has text but no program token (a lone
+        # quote, an empty quoted string) — the upstream command.strip() check
+        # catches whitespace-only, not these, and a structurally-broken command
+        # must not lint clean.
+        findings.error(path, "hook-command-empty",
+                       f"{where}.command has no program token")
+        return
     if status == "unresolved":
         findings.warn(path, "hook-command-unresolved",
                       f"{where}.command has an unresolved variable ('{_show(prog)}'); cannot verify")
@@ -298,10 +319,14 @@ def lint_file(path: str, findings: Findings) -> None:
         )
         return
 
-    for key in dict.fromkeys(dupes):  # unique, first-seen order
+    # One warning per key name, but count every collision: the same name can
+    # shadow values in several objects (or three times in one), and "defined
+    # more than once" alone would under-report that.
+    for key, n in Counter(dupes).items():
+        dropped = "the earlier value" if n == 1 else f"{n} earlier values"
         findings.warn(path, "duplicate-key",
                       f"key '{key}' is defined more than once in an object; "
-                      "JSON keeps the last and silently drops the earlier")
+                      f"JSON keeps the last and silently drops {dropped}")
 
     if not isinstance(data, dict):
         findings.error(
@@ -385,11 +410,10 @@ def _lint_hook_entry(entry: object, event: str, idx: int, path: str, findings: F
             # by Claude Code; an un-compilable one silently matches nothing, so the
             # hook is dead — that we do flag.
             elif matcher not in ("", "*"):
-                try:
-                    re.compile(matcher)
-                except re.error as exc:
+                err = _matcher_error(matcher)
+                if err:
                     findings.error(path, "matcher-invalid-regex",
-                                   f"{where}.matcher '{_show(matcher)}' is not a valid regex: {exc}")
+                                   f"{where}.matcher '{_show(matcher)}' is not a valid regex: {err}")
 
     runners = entry["hooks"]
     if not isinstance(runners, list):
@@ -401,6 +425,36 @@ def _lint_hook_entry(entry: object, event: str, idx: int, path: str, findings: F
                       f"{where}.hooks is empty; the entry runs nothing")
     for j, runner in enumerate(runners):
         _lint_hook_runner(runner, f"{where}.hooks[{j}]", path, findings)
+
+
+_JS_NAMED_GROUP = re.compile(r"\(\?<(?![=!])")   # (?<name>… — Python spells it (?P<name>…
+_JS_PROP_CLASS = re.compile(r"\\[pP]\{[^}]*\}")  # \p{L} etc. — no stdlib-re equivalent
+
+
+def _matcher_error(matcher: str) -> str | None:
+    """The compile-error message for a matcher invalid as a JS regex, else None.
+
+    Claude Code compiles matchers as JavaScript regexes; the closest stdlib
+    check is Python's `re`, and the engines disagree on real syntax — JS named
+    groups, \\p{…} property classes, and variable-length lookbehind are all
+    valid JS that `re` rejects. Flagging those would be an invalid-regex error
+    on a working hook (the cry-wolf failure), so before reporting we retry with
+    the JS-only constructs normalized away; what still fails then (unbalanced
+    parens, a dangling quantifier) is invalid in both engines.
+    """
+    try:
+        re.compile(matcher)
+        return None
+    except re.error as exc:
+        first = exc
+    normalized = _JS_PROP_CLASS.sub("X", _JS_NAMED_GROUP.sub("(?P<", matcher))
+    try:
+        re.compile(normalized)
+        return None
+    except re.error as exc:
+        if "look-behind requires fixed-width pattern" in str(exc):
+            return None  # a Python-only restriction; JS allows any lookbehind
+        return str(first)
 
 
 def _lint_hook_runner(runner: object, where: str, path: str, findings: Findings) -> None:

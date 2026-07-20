@@ -1,0 +1,4 @@
+# Pins two behaviors: a quoted program path with spaces is taken whole, and
+# for a settings.json sitting directly in a directory (no .claude/) the
+# default $CLAUDE_PROJECT_DIR is that directory itself.
+findings=0

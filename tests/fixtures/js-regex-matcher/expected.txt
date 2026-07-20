@@ -1,0 +1,5 @@
+# Matchers are JavaScript regexes. JS-only syntax that Python's re rejects
+# (named groups, \p{…} property classes) must not raise matcher-invalid-regex.
+findings=0
+errors=0
+warnings=0

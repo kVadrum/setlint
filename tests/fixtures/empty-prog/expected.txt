@@ -1,0 +1,4 @@
+# A command with text but no program token (a lone quote) is structurally
+# broken and must not lint clean.
+errors=1
+has.hook-command-empty=1

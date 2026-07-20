@@ -1,0 +1,1 @@
+{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"$HOMEBREW_PREFIX/bin/guard.sh"},{"type":"command","command":"$CLAUDE_PROJECT_DIRT/x.sh"}]}]}}

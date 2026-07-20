@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Assertion evaluator for the settingslint test harness.
+"""Assertion evaluator for the setlint test harness.
 
-Reads a `settingslint --json` payload on stdin and an `expected.txt` path as
+Reads a `setlint --json` payload on stdin and an `expected.txt` path as
 argv[1]. Prints one line per failed assertion and exits nonzero if any failed,
 so the bash harness can report the fixture as failing. A separate file rather
-than an inline heredoc for the same reason weave uses one: `python3 - <<EOF`
-would consume the heredoc as the program and leave json.load with no stdin.
+than an inline heredoc because `python3 - <<EOF` would consume the heredoc as
+the program and leave json.load with no stdin.
 
 Assertion grammar (one `key=value` per line; blank lines and `#` comments
 ignored):
@@ -22,7 +22,15 @@ import sys
 
 
 def main() -> int:
-    data = json.load(sys.stdin)
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        # An empty or partial payload means the tool crashed rather than
+        # reported. Without this guard a crash prints nothing to stdout, the
+        # harness sees zero failed assertions, and the fixture scores PASS —
+        # a green suite hiding a dead linter.
+        print(f"payload: setlint --json produced invalid JSON ({exc.msg})")
+        return 1
     findings = data["findings"]
     summary = data["summary"]
 
