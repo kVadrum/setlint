@@ -1,407 +1,619 @@
-#!/usr/bin/env bash
-# setlint — lint a Claude Code settings.json / settings.local.json.
-# v0.1.4
+#!/usr/bin/env python3
+"""setlint — a linter for Claude Code settings.json / settings.local.json.
+
+Claude Code reads its behavior from `settings.json` (and its git-ignored sibling
+`settings.local.json`) — where hooks get their matchers and commands, where
+permissions get their allow/ask/deny rules, and where `env` is set. It is a
+high-stakes config file with no schema and no load-time validation: a mistake
+does not raise an error, it just silently does something other than what you
+wrote.
+
+Two properties make it worth a linter of its own:
+
+  1. It is *strict* JSON. No comments, no trailing commas. A single stray comma
+     doesn't degrade one setting — Claude Code fails to parse the whole file and
+     silently falls back to defaults. The break is invisible until a hook you
+     were relying on simply never runs.
+
+  2. Its highest-value content — hook wiring — is a nested structure that is
+     easy to get subtly wrong in ways that fail *silently*, with no load-time
+     error:
+
+       - a hook whose `command` sits at the entry level instead of inside a
+         nested `hooks: [{ type, command }]` array never fires;
+       - a `matcher` that isn't a valid regular expression never matches, so the
+         hook is dead;
+       - an `env` value written as a number or boolean instead of a string does
+         not apply;
+       - a `matcher` on an event that has nothing to filter on (Stop,
+         UserPromptSubmit) is silently ignored;
+       - a hook `command` that does not resolve to an executable on disk
+         never runs.
+
+None of those produce an error when Claude Code loads the file. The config just
+quietly does something other than what you wrote. setlint reads the file and
+names them — including resolving each hook command (expanding $CLAUDE_PROJECT_DIR
+and $HOME the way Claude Code does) to confirm it exists and is executable.
+
+Design stance — schema drift is the enemy of a config linter. The settings
+schema is large and grows (new UI keys, new hook events land between releases),
+so an unrecognized *top-level* key or hook event is a **warning**, never an
+error: being a version behind must not make the linter cry wolf on a valid file.
+Errors are reserved for structure that is wrong under any version — malformed
+JSON, a hook that cannot fire, a permission list that isn't a list, an enum with
+a value outside its (stable) set.
+
+Reads files and writes nothing. Point it at a settings file, a directory
+containing one, or a `.claude/` dir; the default is the current directory.
+Text / --json / --ci output. Python 3 stdlib only, no third-party deps (a bash
+rewrite would need jq; this does not).
+
+Exit codes: 0 clean, 1 warnings only, 2 errors (or a usage / no-input error).
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import shutil
+import signal
+import sys
+
+VERSION = "0.2.0"
+
+# --- schema knowledge -------------------------------------------------------
 #
-# Claude Code reads behavior from settings files (project .claude/
-# settings.json + settings.local.json, and the user-level
-# ~/.claude/settings.json). The highest-stakes thing they do is wire
-# PreToolUse / PostToolUse hooks by a `command` string. If that command
-# does not resolve to a file that exists and is executable, the hook
-# silently never runs — and a guardrail you believe is protecting you
-# is not. setlint checks the wiring: valid JSON, well-formed hooks
-# blocks, and — the flagship — that every command-type hook resolves to
-# an executable on disk (resolving $CLAUDE_PROJECT_DIR the way Claude
-# Code does).
+# Deliberately generous. Because an unknown top-level key is only a *warning*,
+# the cost of omitting a real key is a spurious warn, not a broken lint — but we
+# keep the list broad so day-to-day valid files stay quiet. Grounded against
+# live settings files plus the documented schema; extend freely.
+KNOWN_TOP_LEVEL = {
+    "$schema", "apiKeyHelper", "cleanupPeriodDays", "env", "includeCoAuthoredBy",
+    "permissions", "hooks", "model", "statusLine", "outputStyle", "forceLoginMethod",
+    "enableAllProjectMcpServers", "enabledMcpjsonServers", "disabledMcpjsonServers",
+    "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper", "sandbox",
+    "agentPushNotifEnabled", "effortLevel", "enabledPlugins", "skipAutoPermissionPrompt",
+    "skipWorkflowUsageWarning", "theme", "tui", "voice", "voiceEnabled",
+    "alwaysThinkingEnabled", "spinnerTipsEnabled", "autoUpdates", "verbose",
+    "messageIdleNotifThresholdMs", "autoCompactEnabled", "disableAllHooks",
+}
+
+# The hook events Claude Code dispatches. Unknown → warning (a new event may
+# have shipped); we still validate the structure under whatever key is present.
+KNOWN_HOOK_EVENTS = {
+    "PreToolUse", "PostToolUse", "Notification", "UserPromptSubmit",
+    "Stop", "SubagentStop", "PreCompact", "SessionStart", "SessionEnd",
+}
+
+# Events with no phase to match against. A `matcher` on one of these is accepted
+# by the parser but never consulted, so it's a silent no-op — worth a warning.
+# Kept deliberately small: most events DO take a matcher vocabulary (PreToolUse/
+# PostToolUse match tool names; SessionStart matches session origin; SessionEnd
+# the exit reason; Notification the notification type; SubagentStop the agent
+# type; PreCompact its trigger). Only Stop and UserPromptSubmit have nothing to
+# filter on. Anything not listed here is left unflagged — being wrong about a
+# matcher that IS supported is the cry-wolf a config linter must avoid.
+MATCHERLESS_EVENTS = {
+    "UserPromptSubmit", "Stop",
+}
+
+# permissions.defaultMode grows across releases (bypassPermissions, then auto /
+# dontAsk / the `manual` alias landed after the first set), so an unrecognized
+# value is a warning, not an error — same "don't cry wolf a version behind"
+# stance as unknown top-level keys and hook events. Kept current so today's
+# valid modes stay quiet.
+PERMISSION_MODES = {
+    "default", "manual", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions",
+}
+
+# permissions sub-keys whose value must be an array of strings.
+PERMISSION_LIST_KEYS = ("allow", "ask", "deny", "additionalDirectories")
+
+_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _clean(s: str) -> str:
+    """Strip C0/DEL control bytes from a field before it reaches any output.
+
+    A raw control byte would spoof the terminal in text/--ci mode and, echoed
+    from a settings value, could smuggle an ANSI escape into a message. Fields
+    are single-line by contract, so removing controls also protects the --ci
+    stream (newline-delimited) and text alignment. --json is separately safe
+    because json.dumps escapes controls, but we strip first so all three modes
+    show the same sanitized text. Mirrors the linter family's strip_ctrl().
+    """
+    return _CTRL.sub("", s)
+
+
+def _show(v: object, limit: int = 40) -> str:
+    """A short, safe rendering of a JSON value for use inside a message."""
+    if isinstance(v, str):
+        text = v
+    else:
+        text = json.dumps(v)
+    text = text.replace("\n", " ")
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return text
+
+
+def _typename(v: object) -> str:
+    return {
+        dict: "object", list: "array", str: "string", bool: "boolean",
+        int: "number", float: "number", type(None): "null",
+    }.get(type(v), type(v).__name__)
+
+
+class Findings:
+    """Accumulates (level, file, check, message) findings for one run."""
+
+    def __init__(self) -> None:
+        self.items: list[tuple[str, str, str, str]] = []
+
+    def add(self, level: str, file: str, check: str, message: str) -> None:
+        self.items.append((level, _clean(file), _clean(check), _clean(message)))
+
+    def error(self, file: str, check: str, message: str) -> None:
+        self.add("error", file, check, message)
+
+    def warn(self, file: str, check: str, message: str) -> None:
+        self.add("warn", file, check, message)
+
+    @property
+    def errors(self) -> int:
+        return sum(1 for lvl, *_ in self.items if lvl == "error")
+
+    @property
+    def warnings(self) -> int:
+        return sum(1 for lvl, *_ in self.items if lvl == "warn")
+
+
+# --- hook-command resolution ------------------------------------------------
 #
-# hookprobe *runs* a hook with synthetic input; setlint checks that a
-# settings file actually *connects* one. Complementary halves.
-#
-# Bash + jq. Text / --json / --ci output. Exit: 0 clean, 1 warnings
-# only, 2 errors (or usage error).
-set -euo pipefail
+# A hook's `command` can be correct JSON yet never run because the program it
+# names isn't there. setlint resolves the first token the way Claude Code does
+# ($CLAUDE_PROJECT_DIR / $HOME / ~ expansion) and checks it exists + is
+# executable. A miss is an error for an explicit path, a warning for a bare
+# name (runtime PATH may differ) or an unresolved variable (can't verify).
 
-VERSION="0.1.4"
+_HOME = os.path.expanduser("~")
+_PROJECT_DIR_OVERRIDE: str | None = None  # set from --project-dir
+_CMD_COMPLEX = re.compile(r"[|;&<>()`]")
 
-# Each finding is "LEVEL\tFILE\tCHECK\tMESSAGE". FILE is the settings
-# file path as discovered/passed; "" for a run-level finding.
-declare -a FINDINGS=()
-ERRORS=0
-WARNINGS=0
-JSON_MODE=0
-CI_MODE=0
-STRICT=0
-QUIET=0
-PROJECT_DIR_OVERRIDE=""
 
-# ANSI colors only when stdout is a tty.
-if [ -t 1 ]; then
-  C_RED=$'\033[31m'; C_YEL=$'\033[33m'; C_GRN=$'\033[32m'
-  C_DIM=$'\033[2m';  C_OFF=$'\033[0m';  C_BLD=$'\033[1m'
-else
-  C_RED=""; C_YEL=""; C_GRN=""; C_DIM=""; C_OFF=""; C_BLD=""
-fi
+def _projdir_for(path: str) -> str:
+    """The $CLAUDE_PROJECT_DIR for a settings file: the project root, i.e. the
+    parent of the file's directory (settings live in `<proj>/.claude/`). The
+    --project-dir override wins when given."""
+    if _PROJECT_DIR_OVERRIDE is not None:
+        return _PROJECT_DIR_OVERRIDE
+    return os.path.dirname(os.path.dirname(os.path.abspath(path)))
 
-usage() {
-  cat <<EOF
-setlint $VERSION — lint a Claude Code settings.json / settings.local.json
 
-Usage:
-  setlint [PATH]              lint settings at PATH (default: .)
-  setlint --project-dir DIR   resolve \$CLAUDE_PROJECT_DIR to DIR
-  setlint --json              emit findings as a single JSON document
-  setlint --ci                emit GitHub Actions workflow-command annotations
-  setlint --strict            treat warnings as errors (affects exit code)
-  setlint --quiet             suppress the "clean" line; print findings only
-  setlint --version           print version and exit
-  setlint -h | --help         show this help
+def _resolve_prog(cmd: str, projdir: str) -> "tuple[str, str]":
+    """Resolve a hook command's program token. Returns (prog, status) where
+    status is '' (resolved), 'complex', 'empty', or 'unresolved'."""
+    if _CMD_COMPLEX.search(cmd):
+        return "", "complex"
+    # The program is the first token; honor a leading quote so a quoted path
+    # with spaces ("$CLAUDE_PROJECT_DIR/my hook.sh") is taken whole.
+    if cmd.startswith('"'):
+        prog = cmd[1:].split('"', 1)[0]
+    elif cmd.startswith("'"):
+        prog = cmd[1:].split("'", 1)[0]
+    else:
+        parts = cmd.split()
+        prog = parts[0] if parts else ""
+    if not prog:
+        return "", "empty"
+    # Expand the variables Claude Code itself expands, then ~.
+    prog = prog.replace("${CLAUDE_PROJECT_DIR}", projdir).replace("$CLAUDE_PROJECT_DIR", projdir)
+    prog = prog.replace("${HOME}", _HOME).replace("$HOME", _HOME)
+    if prog.startswith("~/"):
+        prog = os.path.join(_HOME, prog[2:])
+    elif prog == "~":
+        prog = _HOME
+    if "$" in prog:  # still variable-shaped -> unverifiable
+        return prog, "unresolved"
+    return prog, ""
 
-PATH may be a settings JSON file, or a directory. For a directory,
-setlint discovers .claude/settings.json, .claude/settings.local.json,
-settings.json and settings.local.json beneath it.
 
-\$CLAUDE_PROJECT_DIR in a hook command is resolved to the project root
-(the directory containing the .claude/ that holds the settings file),
-or to --project-dir if given — the same value Claude Code injects.
+def check_command(command: str, where: str, path: str, findings: Findings) -> None:
+    """Resolve a hook command's program and check the wiring."""
+    prog, status = _resolve_prog(command, _projdir_for(path))
+    if status == "complex":
+        findings.warn(path, "hook-command-complex",
+                      f"{where}.command is a pipeline/compound; not statically checked")
+        return
+    if status == "empty":
+        return  # hook-command-empty already covers this upstream
+    if status == "unresolved":
+        findings.warn(path, "hook-command-unresolved",
+                      f"{where}.command has an unresolved variable ('{_show(prog)}'); cannot verify")
+        return
+    if "/" in prog:
+        if not os.path.exists(prog):
+            findings.error(path, "hook-command-missing",
+                           f"{where}.command path does not exist: '{_show(prog)}'")
+        elif not os.access(prog, os.X_OK):
+            findings.error(path, "hook-command-not-exec",
+                           f"{where}.command path is not executable: '{_show(prog)}'")
+    else:
+        if shutil.which(prog) is None:
+            findings.warn(path, "hook-command-not-on-path",
+                          f"{where}.command not found on PATH at lint time: '{_show(prog)}'")
 
-Checks (errors fail the lint; warnings are advisory unless --strict):
-  error  invalid-json         file is not parseable JSON
-  error  not-object           top-level JSON is not an object
-  error  hooks-not-object     hooks is present but not an object
-  error  event-not-array      a hooks.<Event> value is not an array
-  error  group-not-object     a matcher group is not an object
-  error  group-hooks-bad      a matcher group's hooks is missing or not an array
-  error  hook-not-object      a hook entry is not an object
-  error  hook-no-type         a hook entry has no type
-  error  hook-command-empty   a command hook has an empty command
-  error  hook-command-missing resolved command path does not exist
-  error  hook-command-not-exec   resolved command path exists but is not executable
-  warn   hook-command-unresolved command has an unresolved \$VAR; cannot verify
-  warn   hook-command-complex    command is a pipeline/compound; not statically checked
-  warn   hook-command-not-on-path bare command not found on PATH at lint time
-  warn   misplaced-permission-key top-level allow/deny/ask belongs under permissions
-  warn   key-typo             top-level key looks like a misspelling
 
-A command containing an unresolved variable is NOT an error: the
-format permits runtime-resolved paths, and flagging them would punish
-correct use. setlint asserts only what it can actually resolve.
+# --- the checks -------------------------------------------------------------
 
-Exit codes: 0 clean, 1 warnings only, 2 errors or usage error.
-EOF
-}
 
-die() { printf 'setlint: %s\n' "$1" >&2; exit 2; }
+def lint_file(path: str, findings: Findings) -> None:
+    """Read one settings file and append every finding it raises."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        findings.error(path, "unreadable", f"cannot read file: {exc.strerror or exc}")
+        return
+    except UnicodeDecodeError as exc:
+        # UnicodeDecodeError is a ValueError, not an OSError, so the guard above
+        # cannot catch it — the read crashed with a traceback instead of raising
+        # a finding. Re-reading with errors="replace" would be worse than the
+        # crash: the U+FFFD replacements can still parse as valid JSON, and we
+        # would report a clean file that Claude Code itself refuses to load.
+        # Not-UTF-8 is wrong under any schema version, so it is an error.
+        findings.error(
+            path,
+            "not-utf8",
+            f"not valid UTF-8: byte 0x{exc.object[exc.start]:02x} at position {exc.start}",
+        )
+        return
 
-# emit LEVEL FILE CHECK MESSAGE
-emit() {
-  local level="$1" f chk msg
-  # Strip control characters from input-derived fields: a crafted settings
-  # file's command/key could carry an ESC or tab that corrupts the
-  # tab-delimited record, breaks the single-line text / hand-rolled JSON
-  # output, or spoofs the terminal. setlint audits untrusted config, so
-  # this is in scope.
-  f=$(printf '%s' "$2"   | LC_ALL=C tr -d '\001-\037\177')
-  chk=$(printf '%s' "$3" | LC_ALL=C tr -d '\001-\037\177')
-  msg=$(printf '%s' "$4" | LC_ALL=C tr -d '\001-\037\177')
-  FINDINGS+=("$level"$'\t'"$f"$'\t'"$chk"$'\t'"$msg")
-  case "$level" in
-    error) ERRORS=$((ERRORS + 1)) ;;
-    warn)  WARNINGS=$((WARNINGS + 1)) ;;
-  esac
-}
+    # A key repeated within one object is valid JSON — the parser silently keeps
+    # the last and drops the earlier. In a settings file that means a second
+    # "hooks" or "command" quietly erases the first, with no error anywhere. The
+    # default json.loads hides it; an object_pairs_hook is the only place to see
+    # the raw pairs before de-duplication collapses them.
+    dupes: list[str] = []
 
-# --- project-dir resolution -------------------------------------------------
-# The project root for a settings file at <proj>/.claude/<name> is <proj>.
-project_dir_for() {
-  local file="$1" dir base
-  if [ -n "$PROJECT_DIR_OVERRIDE" ]; then
-    printf '%s' "$PROJECT_DIR_OVERRIDE"
-    return
-  fi
-  dir="$(cd "$(dirname "$file")" && pwd)"
-  base="$(basename "$dir")"
-  if [ "$base" = ".claude" ]; then
-    printf '%s' "$(dirname "$dir")"
-  else
-    printf '%s' "$dir"
-  fi
-}
+    def pairs_hook(pairs: list[tuple[str, object]]) -> dict:
+        obj: dict[str, object] = {}
+        for key, value in pairs:
+            if key in obj:
+                dupes.append(key)
+            obj[key] = value
+        return obj
 
-# --- command resolution (the flagship) --------------------------------------
-# Given a hook command string, resolve its program and check the wiring.
-check_command() {
-  local file="$1" loc="$2" cmd="$3" projdir="$4"
+    try:
+        data = json.loads(raw, object_pairs_hook=pairs_hook)
+    except json.JSONDecodeError as exc:
+        # Strict JSON: one syntax error (a trailing comma, a // comment, a bare
+        # key) sinks the whole file, so Claude Code loads none of it.
+        findings.error(
+            path, "invalid-json",
+            f"not valid JSON at line {exc.lineno} column {exc.colno}: {exc.msg}",
+        )
+        return
 
-  # Compound / pipeline commands run via the shell — the "program" is
-  # not a single token we can stat. Say so rather than guess.
-  case "$cmd" in
-    *'|'*|*';'*|*'&'*|*'<'*|*'>'*|*'('*|*')'*|*'`'*)
-      emit warn "$file" hook-command-complex \
-        "$loc: command is a pipeline/compound; not statically checked"
-      return ;;
-  esac
+    for key in dict.fromkeys(dupes):  # unique, first-seen order
+        findings.warn(path, "duplicate-key",
+                      f"key '{key}' is defined more than once in an object; "
+                      "JSON keeps the last and silently drops the earlier")
 
-  # The program is the first token. Honor a leading quote so a quoted
-  # path (used to protect spaces, e.g. "$CLAUDE_PROJECT_DIR/h.sh") is
-  # taken whole rather than statted with the quote characters attached.
-  local prog rest
-  case "$cmd" in
-    '"'*) prog="${cmd#\"}"; prog="${prog%%\"*}" ;;
-    "'"*) prog="${cmd#\'}"; prog="${prog%%\'*}" ;;
-    *)    read -r prog rest <<<"$cmd" ;;
-  esac
-  [ -n "$prog" ] || { emit error "$file" hook-command-empty "$loc: empty command"; return; }
+    if not isinstance(data, dict):
+        findings.error(
+            path, "not-an-object",
+            f"top level is a {_typename(data)}; settings must be a JSON object",
+        )
+        return
 
-  # Expand the variables Claude Code itself expands.
-  prog="${prog//\$\{CLAUDE_PROJECT_DIR\}/$projdir}"
-  prog="${prog//\$CLAUDE_PROJECT_DIR/$projdir}"
-  prog="${prog//\$\{HOME\}/$HOME}"
-  prog="${prog//\$HOME/$HOME}"
-  case "$prog" in
-    "~/"*) prog="$HOME/${prog#\~/}" ;;
-    "~")   prog="$HOME" ;;
-  esac
+    for key in data:
+        if key in KNOWN_TOP_LEVEL:
+            continue
+        if key in ("allow", "ask", "deny"):
+            findings.warn(path, "misplaced-permission-key",
+                          f"top-level '{key}' belongs under 'permissions', not at the root")
+            continue
+        near = difflib.get_close_matches(key, KNOWN_TOP_LEVEL, n=1, cutoff=0.8)
+        if near:
+            findings.warn(path, "key-typo",
+                          f"top-level key '{key}' looks like a typo of '{near[0]}'")
+        else:
+            findings.warn(path, "unknown-key", f"unrecognized top-level key '{key}'")
 
-  # Anything still variable-shaped is unresolvable — a warning, not an
-  # error. The format permits runtime-resolved paths.
-  case "$prog" in
-    *'$'*)
-      emit warn "$file" hook-command-unresolved \
-        "$loc: command has an unresolved variable ($prog); cannot verify"
-      return ;;
-  esac
+    if "hooks" in data:
+        _lint_hooks(data["hooks"], path, findings)
+    if "permissions" in data:
+        _lint_permissions(data["permissions"], path, findings)
+    if "env" in data:
+        _lint_env(data["env"], path, findings)
 
-  if [[ "$prog" == */* ]]; then
-    if [ ! -e "$prog" ]; then
-      emit error "$file" hook-command-missing \
-        "$loc: command path does not exist: $prog"
-    elif [ ! -x "$prog" ]; then
-      emit error "$file" hook-command-not-exec \
-        "$loc: command path is not executable: $prog"
-    fi
-  else
-    # Bare program name — resolved off PATH at runtime. Runtime PATH may
-    # differ from lint-time PATH, so a miss is a warning, not an error.
-    if ! command -v "$prog" >/dev/null 2>&1; then
-      emit warn "$file" hook-command-not-on-path \
-        "$loc: command not found on PATH at lint time: $prog"
-    fi
-  fi
-}
 
-# --- per-file lint ----------------------------------------------------------
-# jq program: emits structural findings (prefixed STRUCT) and command
-# rows (prefixed CMD) in one pass. Tabs separate fields.
-JQ_PROG='
-def t: type;
-if t != "object" then
-  "STRUCT\terror\tnot-object\ttop-level JSON has type \(t), expected object"
-elif (has("hooks") | not) then
-  empty
-elif (.hooks | t) != "object" then
-  "STRUCT\terror\thooks-not-object\thooks has type \(.hooks|t), expected object"
-else
-  .hooks | to_entries[] as $ev
-  | if ($ev.value | t) != "array" then
-      "STRUCT\terror\tevent-not-array\thooks.\($ev.key) has type \($ev.value|t), expected array"
-    else
-      $ev.value | to_entries[] as $g
-      | if ($g.value | t) != "object" then
-          "STRUCT\terror\tgroup-not-object\thooks.\($ev.key)[\($g.key)] has type \($g.value|t), expected object"
-        elif ($g.value | has("hooks") | not) or ($g.value.hooks | t) != "array" then
-          "STRUCT\terror\tgroup-hooks-bad\thooks.\($ev.key)[\($g.key)].hooks is missing or not an array"
-        else
-          $g.value.hooks | to_entries[] as $h
-          | if ($h.value | t) != "object" then
-              "STRUCT\terror\thook-not-object\thooks.\($ev.key)[\($g.key)].hooks[\($h.key)] is not an object"
-            elif ($h.value | has("type") | not) then
-              "STRUCT\terror\thook-no-type\thooks.\($ev.key)[\($g.key)].hooks[\($h.key)] has no type"
-            elif $h.value.type == "command" and ((($h.value.command // "") | t) != "string" or (($h.value.command // "") | length) == 0) then
-              "STRUCT\terror\thook-command-empty\thooks.\($ev.key)[\($g.key)].hooks[\($h.key)] has an empty command"
-            elif $h.value.type == "command" then
-              "CMD\thooks.\($ev.key)[\($g.key)].hooks[\($h.key)]\t\($h.value.command)"
-            else empty end
-        end
-    end
-end
-'
+def _lint_hooks(hooks: object, path: str, findings: Findings) -> None:
+    if not isinstance(hooks, dict):
+        findings.error(path, "hooks-not-object",
+                       f"'hooks' is a {_typename(hooks)}; must be an object keyed by event")
+        return
 
-# Top-level key sanity. Conservative: only keys that are unambiguously
-# wrong (a known misspelling, or a permission key sitting at top level).
-check_top_keys() {
-  local file="$1" k
-  while IFS= read -r k; do
-    [ -n "$k" ] || continue
-    case "$k" in
-      allow|deny|ask)
-        emit warn "$file" misplaced-permission-key \
-          "top-level \"$k\" belongs under permissions, not at the root" ;;
-      permission)
-        emit warn "$file" key-typo "top-level \"permission\" should be \"permissions\"" ;;
-      hook)
-        emit warn "$file" key-typo "top-level \"hook\" should be \"hooks\"" ;;
-    esac
-  done < <(jq -r 'if type=="object" then keys[] else empty end' "$file" 2>/dev/null)
-}
+    for event, entries in hooks.items():
+        if event not in KNOWN_HOOK_EVENTS:
+            findings.warn(path, "hook-event-unknown",
+                          f"'{event}' is not a known hook event (may be new, or a typo)")
+        if not isinstance(entries, list):
+            findings.error(path, "hook-event-not-array",
+                           f"hooks.{event} is a {_typename(entries)}; must be an array of entries")
+            continue
+        for i, entry in enumerate(entries):
+            _lint_hook_entry(entry, event, i, path, findings)
 
-lint_file() {
-  local file="$1" projdir line kind a b
-  if ! jq -e . "$file" >/dev/null 2>&1; then
-    emit error "$file" invalid-json "not parseable as JSON"
-    return
-  fi
-  check_top_keys "$file"
-  projdir="$(project_dir_for "$file")"
 
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    kind="${line%%$'\t'*}"
-    rest="${line#*$'\t'}"
-    if [ "$kind" = "STRUCT" ]; then
-      # rest = LEVEL \t CHECK \t MESSAGE
-      IFS=$'\t' read -r a b c <<<"$rest"
-      emit "$a" "$file" "$b" "$c"
-    elif [ "$kind" = "CMD" ]; then
-      # rest = LOC \t COMMAND
-      local loc cmd
-      loc="${rest%%$'\t'*}"
-      cmd="${rest#*$'\t'}"
-      check_command "$file" "$loc" "$cmd" "$projdir"
-    fi
-  done < <(jq -r "$JQ_PROG" "$file" 2>/dev/null)
-}
+def _lint_hook_entry(entry: object, event: str, idx: int, path: str, findings: Findings) -> None:
+    where = f"hooks.{event}[{idx}]"
+    if not isinstance(entry, dict):
+        findings.error(path, "hook-entry-not-object",
+                       f"{where} is a {_typename(entry)}; must be an object")
+        return
 
-# --- discovery --------------------------------------------------------------
-discover() {
-  local path="$1"
-  if [ -f "$path" ]; then
-    printf '%s\n' "$path"
-    return
-  fi
-  if [ ! -d "$path" ]; then
-    die "no such file or directory: $path"
-  fi
-  local found=0 c
-  for c in \
-    "$path/.claude/settings.json" \
-    "$path/.claude/settings.local.json" \
-    "$path/settings.json" \
-    "$path/settings.local.json"; do
-    if [ -f "$c" ]; then printf '%s\n' "$c"; found=1; fi
-  done
-  if [ "$found" -eq 0 ]; then
-    die "no settings.json or settings.local.json found under $path"
-  fi
-}
+    # The classic footgun: a command placed directly on the entry instead of
+    # inside a nested hooks[] array. Claude Code loads it and runs nothing.
+    if "hooks" not in entry:
+        if "command" in entry or "type" in entry:
+            findings.error(path, "hook-entry-no-hooks",
+                           f"{where} has 'command'/'type' but no 'hooks' array; "
+                           "commands belong in a nested hooks: [{ type, command }] — as written it never runs")
+        else:
+            findings.error(path, "hook-entry-no-hooks",
+                           f"{where} has no 'hooks' array; nothing will run")
+        return
 
-# --- arg parsing ------------------------------------------------------------
-PATH_ARG=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --json)        JSON_MODE=1 ;;
-    --ci)          CI_MODE=1 ;;
-    --strict)      STRICT=1 ;;
-    --quiet)       QUIET=1 ;;
-    --project-dir) shift; [ $# -gt 0 ] || die "--project-dir needs an argument"; PROJECT_DIR_OVERRIDE="$1" ;;
-    --version)     printf 'setlint %s\n' "$VERSION"; exit 0 ;;
-    -h|--help)     usage; exit 0 ;;
-    --)            shift; break ;;
-    -*)            die "unknown option: $1" ;;
-    *)             [ -z "$PATH_ARG" ] || die "unexpected extra argument: $1"; PATH_ARG="$1" ;;
-  esac
-  shift
-done
-[ $# -gt 0 ] && [ -z "$PATH_ARG" ] && { PATH_ARG="$1"; shift; }
-[ "$JSON_MODE" -eq 1 ] && [ "$CI_MODE" -eq 1 ] && die "--json and --ci are mutually exclusive"
-PATH_ARG="${PATH_ARG:-.}"
+    if "matcher" in entry:
+        matcher = entry["matcher"]
+        if not isinstance(matcher, str):
+            findings.error(path, "matcher-not-string",
+                           f"{where}.matcher is a {_typename(matcher)}; must be a string")
+        else:
+            if event in MATCHERLESS_EVENTS:
+                findings.warn(path, "matcher-ignored",
+                              f"{where} sets a matcher, but {event} has no phase to match — it is ignored")
+            # "*" and "" are Claude Code's documented match-all matchers, special-
+            # cased upstream, not compiled as patterns — so re.compile("*") raising
+            # "nothing to repeat" must not be reported as an invalid matcher (the
+            # linter-fatal false positive). Any other value is treated as a regex
+            # by Claude Code; an un-compilable one silently matches nothing, so the
+            # hook is dead — that we do flag.
+            elif matcher not in ("", "*"):
+                try:
+                    re.compile(matcher)
+                except re.error as exc:
+                    findings.error(path, "matcher-invalid-regex",
+                                   f"{where}.matcher '{_show(matcher)}' is not a valid regex: {exc}")
 
-# discover() dies with exit 2 on no-match; run it in a command
-# substitution (not process substitution) so that exit propagates here
-# instead of being swallowed by a subshell.
-if ! _discovered="$(discover "$PATH_ARG")"; then
-  exit 2
-fi
-mapfile -t TARGETS <<<"$_discovered"
-for f in "${TARGETS[@]}"; do
-  [ -n "$f" ] || continue
-  lint_file "$f"
-done
+    runners = entry["hooks"]
+    if not isinstance(runners, list):
+        findings.error(path, "hooks-not-array",
+                       f"{where}.hooks is a {_typename(runners)}; must be an array")
+        return
+    if not runners:
+        findings.warn(path, "hooks-empty",
+                      f"{where}.hooks is empty; the entry runs nothing")
+    for j, runner in enumerate(runners):
+        _lint_hook_runner(runner, f"{where}.hooks[{j}]", path, findings)
 
-# --- reporting --------------------------------------------------------------
-json_escape() {
-  local s="$1"
-  s="${s//\\/\\\\}"
-  s="${s//\"/\\\"}"
-  s="${s//$'\t'/\\t}"
-  s="${s//$'\n'/\\n}"
-  s="${s//$'\r'/\\r}"
-  printf '%s' "$s"
-}
 
-print_text() {
-  if [ ${#FINDINGS[@]} -eq 0 ]; then
-    [ "$QUIET" -eq 1 ] || printf "%ssetlint: clean%s\n" "$C_GRN" "$C_OFF"
-    return
-  fi
-  local prev_file="" f level file check msg color sym
-  for f in "${FINDINGS[@]}"; do
-    IFS=$'\t' read -r level file check msg <<<"$f"
-    if [ "$file" != "$prev_file" ]; then
-      printf "\n%s%s%s\n" "$C_BLD" "$file" "$C_OFF"
-      prev_file="$file"
-    fi
-    case "$level" in
-      error) color="$C_RED"; sym="✗" ;;
-      warn)  color="$C_YEL"; sym="!" ;;
-      *)     color="$C_DIM"; sym="·" ;;
-    esac
-    printf "  %s%s %-24s%s %s\n" "$color" "$sym" "$check" "$C_OFF" "$msg"
-  done
-  printf "\n%s%d errors, %d warnings%s\n" "$C_DIM" "$ERRORS" "$WARNINGS" "$C_OFF"
-}
+def _lint_hook_runner(runner: object, where: str, path: str, findings: Findings) -> None:
+    if not isinstance(runner, dict):
+        findings.error(path, "hook-not-object",
+                       f"{where} is a {_typename(runner)}; must be an object with 'type' and 'command'")
+        return
+    htype = runner.get("type")
+    if htype is None:
+        findings.error(path, "hook-type-missing", f"{where} has no 'type'")
+    elif htype != "command":
+        findings.error(path, "hook-type-unknown",
+                       f"{where}.type is '{_show(htype)}'; the only supported hook type is 'command'")
+    command = runner.get("command")
+    if htype == "command" or command is not None:
+        if command is None:
+            # 'hook-command-none' = the field is absent; distinct from
+            # 'hook-command-missing' = the resolved path does not exist on disk.
+            findings.error(path, "hook-command-none",
+                           f"{where} is a command hook with no 'command'")
+        elif not isinstance(command, str):
+            findings.error(path, "hook-command-not-string",
+                           f"{where}.command is a {_typename(command)}; must be a string")
+        elif not command.strip():
+            findings.error(path, "hook-command-empty", f"{where}.command is empty")
+        else:
+            check_command(command, where, path, findings)
 
-print_json() {
-  printf '{\n'
-  printf '  "version": "%s",\n' "$VERSION"
-  printf '  "errors": %d,\n' "$ERRORS"
-  printf '  "warnings": %d,\n' "$WARNINGS"
-  printf '  "findings": ['
-  local first=1 f level file check msg
-  for f in "${FINDINGS[@]:-}"; do
-    [ -z "$f" ] && continue
-    IFS=$'\t' read -r level file check msg <<<"$f"
-    if [ "$first" -eq 1 ]; then printf '\n'; first=0; else printf ',\n'; fi
-    printf '    {"level": "%s", "file": "%s", "check": "%s", "message": "%s"}' \
-      "$(json_escape "$level")" "$(json_escape "$file")" \
-      "$(json_escape "$check")" "$(json_escape "$msg")"
-  done
-  [ "$first" -eq 0 ] && printf '\n  '
-  printf ']\n}\n'
-}
 
-print_ci() {
-  local f level file check msg cmd
-  for f in "${FINDINGS[@]:-}"; do
-    [ -z "$f" ] && continue
-    IFS=$'\t' read -r level file check msg <<<"$f"
-    case "$level" in
-      error) cmd="error" ;;
-      *)     cmd="warning" ;;
-    esac
-    printf '::%s file=%s::setlint %s: %s\n' "$cmd" "$file" "$check" "$msg"
-  done
-}
+def _lint_permissions(perms: object, path: str, findings: Findings) -> None:
+    if not isinstance(perms, dict):
+        findings.error(path, "permissions-not-object",
+                       f"'permissions' is a {_typename(perms)}; must be an object")
+        return
 
-if [ "$JSON_MODE" -eq 1 ]; then
-  print_json
-elif [ "$CI_MODE" -eq 1 ]; then
-  print_ci
-else
-  print_text
-fi
+    mode = perms.get("defaultMode")
+    if mode is not None and not isinstance(mode, str):
+        # A non-string mode (array/object/number/bool) is malformed — and the
+        # `mode not in PERMISSION_MODES` set test below raises TypeError on an
+        # unhashable value, so a settings linter must not itself crash on it.
+        findings.error(path, "default-mode-not-string",
+                       f"permissions.defaultMode is a {_typename(mode)}; must be a string")
+    elif mode is not None and mode not in PERMISSION_MODES:
+        findings.warn(path, "default-mode-unknown",
+                      f"permissions.defaultMode '{_show(mode)}' is not a recognized mode "
+                      f"({', '.join(sorted(PERMISSION_MODES))}) — a typo, or a newer release added it")
 
-if [ "$ERRORS" -gt 0 ]; then exit 2; fi
-if [ "$WARNINGS" -gt 0 ]; then
-  [ "$STRICT" -eq 1 ] && exit 2
-  exit 1
-fi
-exit 0
+    for key in PERMISSION_LIST_KEYS:
+        if key not in perms:
+            continue
+        value = perms[key]
+        if not isinstance(value, list):
+            findings.error(path, "permission-list-not-array",
+                           f"permissions.{key} is a {_typename(value)}; must be an array of strings")
+            continue
+        for i, rule in enumerate(value):
+            if not isinstance(rule, str):
+                findings.error(path, "permission-rule-not-string",
+                               f"permissions.{key}[{i}] is a {_typename(rule)}; must be a string")
+
+
+def _lint_env(env: object, path: str, findings: Findings) -> None:
+    if not isinstance(env, dict):
+        findings.error(path, "env-not-object",
+                       f"'env' is a {_typename(env)}; must be an object of string values")
+        return
+    for key, value in env.items():
+        if not isinstance(value, str):
+            # Claude Code sets env from string values; a number/bool does not apply.
+            findings.error(path, "env-value-not-string",
+                           f"env.{key} is a {_typename(value)}; environment values must be strings")
+
+
+# --- input discovery --------------------------------------------------------
+
+SETTINGS_NAMES = ("settings.json", "settings.local.json")
+
+
+def discover(path: str) -> list[str]:
+    """Resolve a path argument to a list of settings files to lint.
+
+    - a file  → that file, as given (any name; you can lint a renamed copy).
+    - a dir   → settings.json / settings.local.json directly inside it and
+                inside a nested .claude/ (so both `setlint .` from a
+                project root and `setlint ~/.claude` do the right thing).
+    Raises FileNotFoundError if the path is missing, NotADirectoryError never
+    (dirs and files are both handled), and returns [] if a dir holds no
+    settings files (the caller turns that into a clean exit-2 message).
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    if os.path.isfile(path):
+        return [path]
+
+    found: list[str] = []
+    for base in (path, os.path.join(path, ".claude")):
+        for name in SETTINGS_NAMES:
+            candidate = os.path.join(base, name)
+            if os.path.isfile(candidate):
+                found.append(candidate)
+    return found
+
+
+# --- output -----------------------------------------------------------------
+
+
+def render_text(findings: Findings, files: list[str], quiet: bool) -> str:
+    if not findings.items:
+        if quiet:
+            return ""
+        n = len(files)
+        return f"setlint: clean ({n} file{'s' if n != 1 else ''} checked)"
+
+    use_color = sys.stdout.isatty()
+    bold, off = ("\033[1m", "\033[0m") if use_color else ("", "")
+    lines: list[str] = []
+    prev = None
+    for level, file, check, message in findings.items:
+        if file != prev:
+            lines.append(f"{bold}{file}{off}")
+            prev = file
+        lines.append(f"  {level:<5} {check}: {message}")
+    return "\n".join(lines)
+
+
+def render_json(findings: Findings) -> str:
+    payload = {
+        "version": VERSION,
+        "findings": [
+            {"level": lvl, "file": f, "check": c, "message": m}
+            for lvl, f, c, m in findings.items
+        ],
+        "summary": {"errors": findings.errors, "warnings": findings.warnings},
+    }
+    return json.dumps(payload, indent=2)
+
+
+def render_ci(findings: Findings) -> str:
+    lines: list[str] = []
+    for level, file, check, message in findings.items:
+        cmd = "error" if level == "error" else "warning"
+        lines.append(f"::{cmd} file={file}::setlint {check}: {message}")
+    return "\n".join(lines)
+
+
+# --- entry point ------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Behave like a Unix filter: on a closed pipe (`setlint | head`) die quietly
+    # from SIGPIPE instead of raising BrokenPipeError from a partial write.
+    # No-op where SIGPIPE is unavailable (Windows) or not settable (non-main
+    # thread), which keeps the module importable for tests.
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except (AttributeError, ValueError):
+        pass
+
+    parser = argparse.ArgumentParser(
+        prog="setlint",
+        description="Lint Claude Code settings.json / settings.local.json.",
+    )
+    parser.add_argument("path", nargs="?", default=".",
+                        help="settings file, or a directory containing one (default: current dir)")
+    out = parser.add_mutually_exclusive_group()
+    out.add_argument("--json", action="store_true", help="emit findings as a JSON document")
+    out.add_argument("--ci", action="store_true",
+                     help="emit GitHub Actions workflow-command annotations")
+    parser.add_argument("--strict", action="store_true",
+                        help="treat warnings as errors for the exit code")
+    parser.add_argument("--quiet", action="store_true",
+                        help="suppress the 'clean' line; print findings only")
+    parser.add_argument("--project-dir", metavar="DIR",
+                        help="resolve $CLAUDE_PROJECT_DIR in hook commands to DIR "
+                             "(default: the project root above the settings file)")
+    parser.add_argument("--version", action="version", version=f"setlint {VERSION}")
+    args = parser.parse_args(argv)
+
+    if args.project_dir is not None:
+        global _PROJECT_DIR_OVERRIDE
+        _PROJECT_DIR_OVERRIDE = os.path.abspath(os.path.expanduser(args.project_dir))
+
+    try:
+        files = discover(args.path)
+    except FileNotFoundError:
+        print(f"setlint: no such file or directory: {args.path}", file=sys.stderr)
+        return 2
+    if not files:
+        print(f"setlint: no settings.json / settings.local.json under {args.path}",
+              file=sys.stderr)
+        return 2
+
+    findings = Findings()
+    for path in files:
+        lint_file(path, findings)
+
+    if args.json:
+        print(render_json(findings))
+    elif args.ci:
+        text = render_ci(findings)
+        if text:
+            print(text)
+    else:
+        text = render_text(findings, files, args.quiet)
+        if text:
+            print(text)
+
+    if findings.errors:
+        return 2
+    if findings.warnings:
+        return 2 if args.strict else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

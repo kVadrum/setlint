@@ -1,0 +1,2 @@
+has.hook-command-complex=1
+level.hook-command-complex=warn

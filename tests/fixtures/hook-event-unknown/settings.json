@@ -1,0 +1,1 @@
+{ "hooks": { "PreToolCall": [ { "hooks": [ { "type": "command", "command": "true" } ] } ] } }

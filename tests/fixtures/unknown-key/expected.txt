@@ -1,0 +1,4 @@
+has.unknown-key=1
+level.unknown-key=warn
+errors=0
+warnings=1

@@ -23,7 +23,7 @@ synthetic input to test its decision logic. `setlint` is the other
 half: it checks that a settings file actually *connects* a hook in the
 first place.
 
-Bash + [`jq`](https://jqlang.github.io/jq/).
+Python 3, standard library only — no `jq`, no third-party dependencies.
 
 ## Background
 
@@ -76,22 +76,41 @@ Errors fail the lint (exit 2). Warnings are advisory (exit 1) unless
 
 | level | check | meaning |
 |-------|-------|---------|
-| error | `invalid-json` | file is not parseable JSON (Claude Code silently ignores a malformed settings file) |
-| error | `not-object` | top-level JSON is not an object |
+| error | `invalid-json` | file is not parseable JSON (Claude Code silently falls back to defaults) |
+| error | `not-utf8` | file is not valid UTF-8 |
+| error | `not-an-object` | top-level JSON is not an object |
+| error | `unreadable` | the file could not be read |
 | error | `hooks-not-object` | `hooks` is present but not an object |
-| error | `event-not-array` | a `hooks.<Event>` value is not an array |
-| error | `group-not-object` | a matcher group is not an object |
-| error | `group-hooks-bad` | a matcher group's `hooks` is missing or not an array |
-| error | `hook-not-object` | a hook entry is not an object |
-| error | `hook-no-type` | a hook entry has no `type` |
+| error | `hook-event-not-array` | a `hooks.<Event>` value is not an array |
+| error | `hook-entry-not-object` | a matcher entry is not an object |
+| error | `hook-entry-no-hooks` | an entry has `command`/`type` but no nested `hooks` array — it never runs |
+| error | `hooks-not-array` | an entry's `hooks` is not an array |
+| error | `hook-not-object` | a hook is not an object |
+| error | `hook-type-missing` | a hook has no `type` |
+| error | `hook-type-unknown` | a hook's `type` is not `command` |
+| error | `hook-command-none` | a command hook has no `command` field |
+| error | `hook-command-not-string` | `command` is not a string |
 | error | `hook-command-empty` | a `command` hook has an empty command |
 | error | `hook-command-missing` | resolved command path does not exist |
 | error | `hook-command-not-exec` | resolved command path exists but is not executable |
-| warn | `hook-command-unresolved` | command has an unresolved `$VAR`; cannot verify |
+| error | `matcher-not-string` | a `matcher` is not a string |
+| error | `matcher-invalid-regex` | a `matcher` is not a valid regex (`*` and `""` match-all are allowed) |
+| error | `permissions-not-object` | `permissions` is not an object |
+| error | `permission-list-not-array` | `allow`/`ask`/`deny`/`additionalDirectories` is not an array |
+| error | `permission-rule-not-string` | a permission rule is not a string |
+| error | `default-mode-not-string` | `permissions.defaultMode` is not a string |
+| error | `env-not-object` | `env` is not an object |
+| error | `env-value-not-string` | an `env` value is not a string |
+| warn | `unknown-key` | unrecognized top-level key |
+| warn | `key-typo` | top-level key looks like a misspelling of a known one |
+| warn | `misplaced-permission-key` | top-level `allow`/`ask`/`deny` belongs under `permissions` |
+| warn | `hook-event-unknown` | a `hooks` key is not a known event (a newer event may have shipped) |
+| warn | `matcher-ignored` | a `matcher` on an event with nothing to match (`Stop`, `UserPromptSubmit`) |
+| warn | `hooks-empty` | an entry's `hooks` array is empty |
 | warn | `hook-command-complex` | command is a pipeline/compound; not statically checked |
+| warn | `hook-command-unresolved` | command has an unresolved `$VAR`; cannot verify |
 | warn | `hook-command-not-on-path` | bare command not found on `PATH` at lint time |
-| warn | `misplaced-permission-key` | top-level `allow`/`deny`/`ask` belongs under `permissions` |
-| warn | `key-typo` | top-level key is a known misspelling (`permission`, `hook`) |
+| warn | `default-mode-unknown` | `permissions.defaultMode` is not a recognized mode |
 
 ## Requirements, not permissions
 
@@ -158,10 +177,12 @@ $ setlint .
 tests/run.sh
 ```
 
-Fixture-driven: each `tests/fixtures/<name>/` is a small project tree
-plus an `expected.txt` (exit code + the check names that fixture should
-emit). The `not-exec` fixture commits a mode-644 hook script, so the
-executable bit is part of the fixture — preserve it under git.
+Fixture-driven: each `tests/fixtures/<name>/` is a small settings tree
+plus an `expected.txt` of `key=value` assertions (`has.<check>`,
+`level.<check>`, `count.<check>`, `absent.<check>`, `errors`, `warnings`)
+checked against `setlint --json` by `tests/check.py`. The `not-exec`
+fixture commits a mode-644 hook script, so the executable bit is part of
+the fixture — preserve it under git. Python 3 only; no network.
 
 ## License
 

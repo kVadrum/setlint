@@ -1,0 +1,2 @@
+has.matcher-invalid-regex=1
+level.matcher-invalid-regex=error

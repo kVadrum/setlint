@@ -1,0 +1,4 @@
+has.matcher-ignored=1
+level.matcher-ignored=warn
+errors=0
+warnings=1

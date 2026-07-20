@@ -1,0 +1,2 @@
+has.hook-command-not-exec=1
+level.hook-command-not-exec=error

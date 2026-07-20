@@ -1,0 +1,2 @@
+has.hook-command-missing=1
+level.hook-command-missing=error

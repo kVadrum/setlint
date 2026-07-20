@@ -1,0 +1,2 @@
+has.hook-command-unresolved=1
+level.hook-command-unresolved=warn

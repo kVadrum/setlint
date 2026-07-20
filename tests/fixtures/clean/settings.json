@@ -1,0 +1,17 @@
+{
+  "model": "claude-opus-4-8",
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": ["Bash", "Edit", "Read"],
+    "deny": []
+  },
+  "env": { "FOO": "bar" },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "true" } ] }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "true" } ] }
+    ]
+  }
+}

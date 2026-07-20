@@ -1,5 +1,0 @@
-1
-hook-command-unresolved
-hook-command-complex
-misplaced-permission-key
-key-typo

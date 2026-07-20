@@ -1,0 +1,3 @@
+has.default-mode-not-string=1
+level.default-mode-not-string=error
+absent.default-mode-unknown=1

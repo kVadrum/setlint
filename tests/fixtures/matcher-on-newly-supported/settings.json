@@ -1,0 +1,1 @@
+{ "hooks": { "SessionEnd": [ { "matcher": "clear", "hooks": [ { "type": "command", "command": "true" } ] } ], "Notification": [ { "matcher": "idle_prompt", "hooks": [ { "type": "command", "command": "true" } ] } ], "SubagentStop": [ { "matcher": "Explore", "hooks": [ { "type": "command", "command": "true" } ] } ] } }

@@ -1,0 +1,2 @@
+has.hook-type-unknown=1
+level.hook-type-unknown=error

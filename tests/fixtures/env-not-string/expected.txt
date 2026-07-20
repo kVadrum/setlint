@@ -1,0 +1,2 @@
+count.env-value-not-string=2
+level.env-value-not-string=error

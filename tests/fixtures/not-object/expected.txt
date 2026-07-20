@@ -1,0 +1,3 @@
+has.not-an-object=1
+level.not-an-object=error
+findings=1

@@ -1,0 +1,2 @@
+has.hook-command-not-on-path=1
+level.hook-command-not-on-path=warn

@@ -1,0 +1,9 @@
+{
+  "model": "a",
+  "model": "b",
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "true", "command": "true" } ] }
+    ]
+  }
+}

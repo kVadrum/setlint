@@ -1,117 +1,93 @@
 #!/usr/bin/env bash
-# setlint test harness — fixture-driven.
+# setlint test harness — fixture-driven, no repo or network needed.
 #
-# Each fixture is a directory tests/fixtures/<name>/ holding a project
-# tree (a .claude/ with settings + any hook scripts) plus an
-# expected.txt:
+# Each tests/fixtures/<case>/ holds a synthetic settings.json plus an
+# expected.txt of `key=value` assertions checked against
+# `setlint --json <case>`. Pointing the tool at the directory also
+# exercises discovery (it finds settings.json inside), and expected.txt is
+# invisible to the tool because discovery only looks for settings.json /
+# settings.local.json.
 #
-#   <expected exit code>
-#   <check name>          (zero or more lines; repeat a name to expect
-#   <check name>           it more than once)
-#
-# expected.txt is compared as a sorted multiset of check names against
-# the checks setlint actually emits (parsed from --json), plus the exit
-# code. setlint discovers settings under the fixture dir, so expected.txt
-# sitting at the fixture root is never linted.
-#
-# The executable bit on fixture hook scripts is load-bearing (the
-# not-exec fixture commits a 644 script): preserve it under git.
-
+# NOT `set -e`: every assertion runs even after one fails.
 set -uo pipefail
 
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
-SETLINT="$REPO/bin/setlint"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TOOL="$REPO/bin/setlint"
 FIXTURES="$REPO/tests/fixtures"
-
 PASS=0
 FAIL=0
-declare -a FAILURES=()
+ok()  { PASS=$((PASS + 1)); }
+bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 
-# Extract emitted check names (sorted) from a fixture's --json output.
-emitted_checks() {
-  "$SETLINT" --json "$1" 2>/dev/null \
-    | jq -r '.findings[].check' \
-    | LC_ALL=C sort
-}
+evaluate() { python3 "$REPO/tests/check.py" "$1"; }
 
-run_fixture() {
-  local dir="$1" name
-  name="$(basename "$dir")"
-
-  local exp_exit exp_checks
-  exp_exit="$(head -n1 "$dir/expected.txt")"
-  exp_checks="$(tail -n +2 "$dir/expected.txt" | grep -vE '^\s*$' | LC_ALL=C sort)"
-
-  "$SETLINT" "$dir" >/dev/null 2>&1
-  local got_exit=$?
-  local got_checks
-  got_checks="$(emitted_checks "$dir")"
-
-  local ok=1 why=""
-  if [ "$got_exit" != "$exp_exit" ]; then
-    ok=0; why="exit $got_exit (want $exp_exit)"
-  fi
-  if [ "$got_checks" != "$exp_checks" ]; then
-    ok=0
-    why="${why:+$why; }checks differ"
-  fi
-
-  if [ "$ok" -eq 1 ]; then
-    PASS=$((PASS + 1))
-    printf '  ok   %s\n' "$name"
-  else
-    FAIL=$((FAIL + 1))
-    printf '  FAIL %s — %s\n' "$name" "$why"
-    FAILURES+=("$name")
-    {
-      printf '       expected exit %s, checks: [%s]\n' \
-        "$exp_exit" "$(printf '%s' "$exp_checks" | tr '\n' ' ')"
-      printf '       got      exit %s, checks: [%s]\n' \
-        "$got_exit" "$(printf '%s' "$got_checks" | tr '\n' ' ')"
-    }
-  fi
-}
-
-echo "setlint test suite"
-echo
+# --- 1. fixture assertions --------------------------------------------------
 
 for dir in "$FIXTURES"/*/; do
-  [ -f "$dir/expected.txt" ] || continue
-  run_fixture "${dir%/}"
+  name="$(basename "$dir")"
+  exp="$dir/expected.txt"
+  [ -f "$exp" ] || { bad "$name: missing expected.txt"; continue; }
+  out="$("$TOOL" --json "$dir" 2>/dev/null)"
+  msg="$(printf '%s' "$out" | evaluate "$exp")"
+  if [ -z "$msg" ]; then ok; else bad "$name: $(printf '%s' "$msg" | tr '\n' ';')"; fi
 done
 
-# --- behavioral cases not tied to a fixture tree -----------------------------
-behavioral() {
-  local label="$1"; shift
-  local want_exit="$1"; shift
-  "$@" >/dev/null 2>&1
-  local got=$?
-  if [ "$got" = "$want_exit" ]; then
-    PASS=$((PASS + 1)); printf '  ok   %s\n' "$label"
-  else
-    FAIL=$((FAIL + 1)); printf '  FAIL %s — exit %s (want %s)\n' "$label" "$got" "$want_exit"
-    FAILURES+=("$label")
-  fi
-}
+# --- 2. exit-code / flag behavior -------------------------------------------
 
-echo
-echo "behavioral:"
-behavioral "version exits 0"          0 "$SETLINT" --version
-behavioral "help exits 0"             0 "$SETLINT" --help
-behavioral "unknown flag exits 2"     2 "$SETLINT" --nope
-behavioral "missing path exits 2"     2 "$SETLINT" /no/such/dir/setlint-test
-behavioral "no settings -> exit 2"    2 "$SETLINT" "$REPO/bin"
-behavioral "json+ci exclusive"        2 "$SETLINT" --json --ci "$FIXTURES/clean"
-behavioral "strict warns -> exit 2"   2 "$SETLINT" --strict "$FIXTURES/warnings"
-behavioral "strict clean -> exit 0"   0 "$SETLINT" --strict "$FIXTURES/clean"
-behavioral "file arg directly"        2 "$SETLINT" "$FIXTURES/invalid-json/.claude/settings.json"
-behavioral "project-dir override"     2 "$SETLINT" --project-dir /no/such "$FIXTURES/clean"
+"$TOOL" "$FIXTURES/clean" >/dev/null 2>&1; rc=$?
+[ "$rc" = 0 ] && ok || bad "clean tree should exit 0, got $rc"
 
-echo
-echo "------------------------------------"
-printf '%d passed, %d failed\n' "$PASS" "$FAIL"
-if [ "$FAIL" -gt 0 ]; then
-  printf 'failures: %s\n' "${FAILURES[*]}"
-  exit 1
-fi
-exit 0
+"$TOOL" "$FIXTURES/matcher-ignored" >/dev/null 2>&1; rc=$?
+[ "$rc" = 1 ] && ok || bad "warnings-only should exit 1, got $rc"
+
+"$TOOL" --strict "$FIXTURES/matcher-ignored" >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && ok || bad "--strict on a warning should exit 2, got $rc"
+
+"$TOOL" "$FIXTURES/hook-wrong-level" >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && ok || bad "an error should exit 2, got $rc"
+
+"$TOOL" "$FIXTURES/does-not-exist" >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && ok || bad "a missing path should exit 2, got $rc"
+
+EMPTY="$(mktemp -d)"; trap 'rmdir "$EMPTY" 2>/dev/null' EXIT
+"$TOOL" "$EMPTY" >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && ok || bad "a directory with no settings files should exit 2, got $rc"
+
+"$TOOL" --json --ci "$FIXTURES/clean" >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && ok || bad "--json and --ci together should exit 2, got $rc"
+
+# --quiet suppresses the clean line; findings-only stays silent on a clean tree.
+out="$("$TOOL" --quiet "$FIXTURES/clean" 2>/dev/null)"
+[ -z "$out" ] && ok || bad "--quiet on a clean tree should print nothing, got: $out"
+
+# --ci emits a GitHub Actions annotation for an error.
+out="$("$TOOL" --ci "$FIXTURES/hook-wrong-level" 2>/dev/null)"
+printf '%s' "$out" | grep -q '^::error file=' && ok || bad "--ci should emit ::error, got: $out"
+
+# --- 3. a settings.json that is not valid UTF-8 -----------------------------
+#
+# Generated here rather than committed as a fixture: the whole point is a byte
+# no editor can render, and a committed 0xff is exactly the kind of thing a
+# well-meaning editor or normalizing tool silently rewrites — which would turn
+# this into a test that passes while testing nothing. Building it at run time
+# keeps the tracked tree valid UTF-8 and makes the offending byte explicit.
+#
+# Regression: the read guard used to be `except OSError`, but UnicodeDecodeError
+# is a ValueError — so this input crashed with a traceback instead of raising a
+# finding. Must be an error (exit 2), never a crash, and never a clean report.
+BADUTF="$(mktemp -d)"
+trap 'rm -rf "$EMPTY" "$BADUTF" 2>/dev/null' EXIT
+printf '{"env":{"A":"\xff\xfe"}}' > "$BADUTF/settings.json"
+
+out="$("$TOOL" --json "$BADUTF" 2>/dev/null)"; rc=$?
+[ "$rc" = 2 ] && ok || bad "a non-UTF-8 settings.json should exit 2, got $rc"
+printf '%s' "$out" | grep -q '"check": *"not-utf8"' && ok \
+  || bad "a non-UTF-8 settings.json should raise not-utf8, got: $out"
+# The crash wrote a traceback to stderr; a finding must not.
+err="$("$TOOL" "$BADUTF" 2>&1 >/dev/null)"
+printf '%s' "$err" | grep -q 'Traceback' && bad "non-UTF-8 input still tracebacks" || ok
+
+# --- summary ----------------------------------------------------------------
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

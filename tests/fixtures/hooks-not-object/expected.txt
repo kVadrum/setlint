@@ -1,0 +1,2 @@
+has.hooks-not-object=1
+level.hooks-not-object=error

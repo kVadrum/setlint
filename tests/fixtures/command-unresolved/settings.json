@@ -1,0 +1,1 @@
+{ "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "$SETLINT_UNSET_VAR/x.sh" } ] } ] } }

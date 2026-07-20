@@ -1,0 +1,4 @@
+has.duplicate-key=1
+level.duplicate-key=warn
+count.duplicate-key=2
+errors=0

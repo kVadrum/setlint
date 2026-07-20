@@ -1,3 +1,4 @@
+absent.matcher-invalid-regex=1
 errors=0
 warnings=0
 findings=0

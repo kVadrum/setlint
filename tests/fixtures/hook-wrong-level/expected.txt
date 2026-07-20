@@ -1,0 +1,3 @@
+has.hook-entry-no-hooks=1
+level.hook-entry-no-hooks=error
+errors=1

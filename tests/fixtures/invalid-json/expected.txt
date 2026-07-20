@@ -1,2 +1,3 @@
-2
-invalid-json
+has.invalid-json=1
+level.invalid-json=error
+findings=1

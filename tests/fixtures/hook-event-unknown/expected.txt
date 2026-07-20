@@ -1,0 +1,3 @@
+has.hook-event-unknown=1
+level.hook-event-unknown=warn
+errors=0

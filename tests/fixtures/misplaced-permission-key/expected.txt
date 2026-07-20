@@ -1,0 +1,2 @@
+has.misplaced-permission-key=1
+level.misplaced-permission-key=warn

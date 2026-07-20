@@ -1,0 +1,1 @@
+{ "hooks": { "Stop": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": "true" } ] } ] } }

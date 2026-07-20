@@ -1,0 +1,4 @@
+has.default-mode-unknown=1
+level.default-mode-unknown=warn
+errors=0
+warnings=1
